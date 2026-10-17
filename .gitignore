@@ -1,0 +1,10 @@
+# Compilación
+build/
+# Headers CMSIS de ST (se bajan con "make cmsis")
+cmsis/
+# Auxiliares de LaTeX
+doc/*.aux
+doc/*.log
+doc/*.out
+doc/*.toc
+doc/*.synctex.gz

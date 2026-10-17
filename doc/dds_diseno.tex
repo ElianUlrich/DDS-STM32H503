@@ -1,0 +1,457 @@
+% =========================================================================
+%  Generador DDS con STM32H503CBT6 - Diseño y diagramas de flujo
+%  Compilar:  pdflatex dds_diseno.tex   (dos veces, por las referencias)
+%  Requiere doc/datos_escalera.dat (lo genera "make test").
+% =========================================================================
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,array,tabularx}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric,shapes.misc,arrows.meta,positioning,calc,fit,backgrounds}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+
+\definecolor{azul}{RGB}{31,78,140}
+\definecolor{celeste}{RGB}{220,232,247}
+\definecolor{verde}{RGB}{226,243,226}
+\definecolor{amarillo}{RGB}{255,245,214}
+\definecolor{rojo}{RGB}{250,224,224}
+\definecolor{gris}{RGB}{238,238,238}
+
+% ---------------- Estilos de diagrama de flujo ----------------
+\tikzset{
+  base/.style      = {draw, thick, align=center, font=\small, minimum height=8mm},
+  inicio/.style    = {base, rounded rectangle, fill=verde, minimum width=26mm},
+  proceso/.style   = {base, rectangle, fill=celeste, text width=58mm},
+  procesoc/.style  = {base, rectangle, fill=celeste, text width=50mm},
+  ancho/.style     = {base, rectangle, fill=celeste, text width=92mm},
+  sub/.style       = {proceso, draw, double, double distance=1.2pt},
+  decision/.style  = {base, diamond, aspect=2.4, fill=amarillo, inner sep=1pt, text width=30mm},
+  io/.style        = {base, trapezium, trapezium left angle=72, trapezium right angle=108,
+                      fill=rojo, text width=44mm, trapezium stretches body},
+  flecha/.style    = {-{Stealth[length=2.6mm]}, thick},
+  bloque/.style    = {draw, thick, rounded corners=2pt, align=center, font=\small,
+                      fill=celeste, minimum height=10mm, inner sep=4pt},
+  etq/.style       = {font=\footnotesize\itshape, inner sep=1pt},
+}
+
+\title{\textbf{Generador de funciones DDS con STM32H503CBT6}\\[2mm]
+\large Diseño, decisiones de ingeniería y diagramas de flujo}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-12mm}
+
+\section{Resumen del diseño}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Parámetro} & \textbf{Valor} \\
+\midrule
+Microcontrolador & STM32H503CBT6 (Cortex-M33, 250\,MHz, 128\,KB flash, 32\,KB RAM) \\
+Reloj de muestreo & TIM2 $\rightarrow$ TRGO, $F_s = 250\,\text{MHz}/250 = 1\,\text{MS/s}$ \\
+Salidas & DAC1 CH1 (PA4) y CH2 (PA5), modo dual, 12 bits \\
+Transferencia & GPDMA1 canal 0, circular por lista enlazada, buffer ping-pong $2\times256$ \\
+Acumulador de fase & 32 bits $\Rightarrow$ resolución $F_s/2^{32} = 0{,}233$\,mHz \\
+Tabla & 4096 muestras $\times$ 12 bits (en \texttt{uint16\_t}), doble buffer en RAM \\
+Rango de salida & 0,1\,Hz a 400\,kHz ($0{,}4\,F_s$) \\
+Interpolación & lineal, automática para $f < F_s/N = 244$\,Hz \\
+Encoders & TIM1 (frecuencia) y TIM3 (forma de onda), modo encoder por hardware \\
+Formas de onda & seno, triangular, sierra $\pm$, cuadrada, seno rectificado, arbitraria \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =========================================================================
+\section{Arquitectura}
+
+La idea central es que \textbf{el CPU nunca escribe en el DAC}. El timer marca
+el ritmo con una precisión de cristal, el DAC convierte en cada flanco de TRGO
+y el GPDMA le entrega la muestra siguiente. El CPU solo recalcula la mitad del
+buffer que el DMA ya terminó de leer. Así el jitter de muestreo es nulo, sin
+importar las interrupciones que haya.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[bloque/.append style={text width=22mm}]
+  % columnas: x = 0 / 4.3 / 8.6 / 12.9 cm
+  \node[bloque, fill=gris, text width=25mm] (encf) at (0,0)    {Encoder\\FRECUENCIA};
+  \node[bloque, fill=gris, text width=25mm] (encw) at (0,-1.9) {Encoder\\FORMA};
+  \node[bloque] (tim1) at (4.3,0)    {TIM1\\encoder x4};
+  \node[bloque] (tim3) at (4.3,-1.9) {TIM3\\encoder x4};
+  \node[bloque, fill=verde] (ui)  at (8.6,-0.95) {Lazo principal\\\texttt{ui\_task()}};
+  \node[bloque, fill=gris, dashed] (lcd) at (8.6,1.3) {Pantalla\\(futuro)};
+  \node[bloque, fill=amarillo] (par) at (12.9,-0.95) {Parámetros DDS\\$M$, tabla activa,\\modo CH2};
+  \node[bloque, fill=rojo] (isr) at (12.9,-3.4) {ISR GPDMA\\\texttt{dds\_fill()}};
+  \node[bloque] (buf)  at (12.9,-5.8) {Buffer RAM\\$2\times256\times32$\,b};
+  \node[bloque] (dma)  at (8.6,-5.8)  {GPDMA1\\canal 0};
+  \node[bloque] (dac)  at (4.3,-5.8)  {DAC1\\CH1 + CH2\\(DHR12RD)};
+  \node[bloque] (tim2) at (4.3,-3.4)  {TIM2\\$F_s$ = 1\,MS/s};
+  \node[bloque, fill=gris] (filt) at (0,-5.8) {Filtro\\reconstructor};
+
+  \draw[flecha] (encf) -- (tim1);
+  \draw[flecha] (encw) -- (tim3);
+  \draw[flecha] (tim1.east) -- ++(6mm,0) |- ([yshift=2mm]ui.west);
+  \draw[flecha] (tim3.east) -- ++(6mm,0) |- ([yshift=-2mm]ui.west);
+  \draw[flecha] (ui) -- (par);
+  \draw[flecha, dashed] (ui) -- (lcd);
+  \draw[flecha] (par) -- (isr);
+  \draw[flecha] (isr) -- node[etq, right, align=left]{escribe la\\mitad libre} (buf);
+  \draw[flecha] (buf) -- (dma);
+  \draw[flecha] ([yshift=-2.5mm]dma.west) -- node[etq, below]{datos} ([yshift=-2.5mm]dac.east);
+  \draw[flecha] ([yshift=2.5mm]dac.east) -- node[etq, above]{req.} ([yshift=2.5mm]dma.west);
+  \draw[flecha] (tim2) -- node[etq, right]{TRGO} (dac);
+  \draw[flecha] (dma.north) |- node[etq, pos=0.75, above]{HT / TC} (isr.west);
+  \draw[flecha] (dac) -- node[etq, above]{PA4/5} (filt);
+\end{tikzpicture}
+\caption{Diagrama en bloques del generador.}
+\end{figure}
+
+% =========================================================================
+\section{Decisiones de diseño}
+
+\subsection{¿TIM1 o TIM2?}
+
+En el STM32H503 el DAC puede dispararse desde TIM1, TIM2, TIM3, TIM6, TIM7 y
+LPTIM1/2 (campo \texttt{TSELx} de \texttt{DAC\_CR}). Todos los timers corren a
+250\,MHz con el prescaler de APB en 1, así que la resolución de $F_s$ es la
+misma con cualquiera. La diferencia está en lo que se pierde al usarlo:
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}l>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Timer} & \textbf{Características} & \textbf{Uso en este diseño} \\
+\midrule
+TIM1 & Avanzado, 16 bits, PWM complementario con tiempo muerto, el único del chip &
+       \textbf{Encoder de frecuencia} (PA8/PA9). Usarlo solo como reloj desperdiciaría sus funciones. \\
+TIM2 & 32 bits, 4 canales, dispara al DAC (\texttt{TSEL}=2) &
+       \textbf{Reloj de muestreo del DDS} (elegido) \\
+TIM3 & 16 bits, 4 canales, modo encoder & \textbf{Encoder de forma de onda} (PA6/PA7) \\
+TIM6 & Básico, sin pines, pensado para el DAC (\texttt{TSEL}=5) &
+       Alternativa equivalente: \texttt{DDS\_TIMER\_TIM6} en \texttt{dds\_config.h} libera TIM2 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Para generar el TRGO, TIM1 y TIM2 dan el mismo resultado. Elegí \textbf{TIM2}
+porque TIM1 es el único timer avanzado del chip y su par de pines PA8/PA9 sirve
+muy bien para el encoder. Hacen falta dos timers con modo encoder (TIM1 y TIM3),
+y con TIM2 en el DDS no se desperdicia ninguna función especial.
+
+\subsection{Frecuencia de muestreo y frecuencia máxima}
+
+\begin{equation}
+F_s = \frac{f_{TIM}}{ARR+1} = \frac{250\,\text{MHz}}{250} = 1\,\text{MS/s}
+\qquad
+M = \operatorname{round}\!\left(\frac{f_{out}\cdot 2^{32}}{F_s}\right)
+\qquad
+\Delta f = \frac{F_s}{2^{32}} = 0{,}233\,\text{mHz}
+\end{equation}
+
+Elegí 1\,MS/s porque es la velocidad de actualización típica que especifica ST
+para sus DAC con el buffer de salida activado (confirmalo en la tabla
+\emph{DAC characteristics} del DS14053). El límite teórico es Nyquist,
+$F_s/2 = 500$\,kHz. En la práctica conviene $f_{max} = 0{,}4\,F_s = 400$\,kHz,
+porque la primera imagen cae en $F_s - f$ y el filtro reconstructor necesita
+banda de transición. La retención de orden cero atenúa según
+$\operatorname{sinc}(f/F_s)$: a 400\,kHz se pierden 2,4\,dB. Para un seno limpio
+sin un filtro muy abrupto, conviene quedarse por debajo de $F_s/4 = 250$\,kHz.
+Las formas con armónicos (cuadrada, sierra) se ven bien hasta $\approx F_s/20$.
+
+Si el DAC de tu placa lo soporta, \texttt{DDS\_FS\_HZ} acepta 2; 2,5 y 5\,MS/s,
+que son divisores exactos de 250\,MHz. Por encima de 1\,MS/s usá
+\texttt{MODE = 010} (buffer interno OFF) y un amplificador operacional rápido
+como buffer externo. El CPU acompaña: a 5\,MS/s el lazo directo usa
+$\approx 25$\,\% del tiempo.
+
+\subsection{Tamaño de tabla recomendado: \texorpdfstring{$4096\times12$}{4096x12} bits}
+
+En un DDS, $N$ \textbf{no} es la cantidad de muestras por período que salen. Esas
+son siempre $F_s/f_{out}$. $N$ fija la \emph{precisión de fase}. Al truncar la
+fase a $\log_2 N$ bits aparecen espurias de aproximadamente
+$\text{SFDR}\approx 6{,}02\cdot\log_2 N$ dBc.
+
+\begin{center}
+\begin{tabular}{@{}rccccl@{}}
+\toprule
+$N$ & RAM (2 buffers) & SFDR trunc. & Error seno interp. & Sierra & Comentario \\
+\midrule
+256   & 1\,KB  & $\approx 48$ dBc & 0,15 LSB    & 16 LSB/paso & solo con interpolación \\
+1024  & 4\,KB  & $\approx 60$ dBc & 0,01 LSB    & 4 LSB/paso  & aceptable \\
+\textbf{4096} & \textbf{16\,KB} & $\boldsymbol{\approx 72}$ \textbf{dBc} & \textbf{0,0006 LSB} & \textbf{1 LSB/paso} & \textbf{recomendado} \\
+16384 & 64\,KB & $\approx 84$ dBc & --          & 1 LSB/paso  & no entra en 32\,KB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Recomendación: 4096 muestras de 12 bits guardadas en \texttt{uint16\_t}}
+(8\,KB por tabla), por estas razones:
+\begin{itemize}\itemsep0pt
+  \item 72\,dBc de SFDR coinciden con el techo de un DAC ideal de 12 bits
+        ($6{,}02\cdot12+1{,}76 = 74$\,dB). Una tabla más grande no mejora la
+        salida porque manda el DAC.
+  \item Una sierra de 4096 pasos recorre los 4096 códigos: 1 LSB por muestra, sin pérdida.
+  \item El índice se obtiene con un desplazamiento (\texttt{fase >> 20}), sin módulo.
+  \item 12 bits justificados a la derecha van directo al registro \texttt{DHR12RD}.
+  \item Con doble buffer (16\,KB) el cambio de forma de onda no produce glitches,
+        y todavía sobra la mitad de la RAM.
+  \item Se agrega una muestra guarda ($T[4096]=T[0]$) para que la interpolación
+        lea $T[i+1]$ sin máscara.
+\end{itemize}
+Las tablas se calculan en el arranque (seno, triangular, etc.). Las formas
+arbitrarias se ``graban'' en flash con \texttt{tools/gen\_tabla.py}, a partir de
+una fórmula o de un CSV medido, y se copian a RAM al seleccionarlas.
+
+\subsection{Interpolación lineal en baja frecuencia}
+
+Cuando $f_{out} < F_s/N$ (244\,Hz), el paso de fase es menor que una muestra de
+tabla y cada valor se repite varias veces. El resultado es una escalera. En ese
+caso se usan los 12 bits de fracción que siguen al índice:
+
+\begin{equation}
+\underbrace{\texttt{fase}[31{:}20]}_{i}\;\;
+\underbrace{\texttt{fase}[19{:}8]}_{\phi}\qquad
+y = T[i] + \left\lfloor\frac{(T[i+1]-T[i])\cdot\phi + 2^{11}}{2^{12}}\right\rfloor
+\end{equation}
+
+El error máximo de la interpolación lineal sobre un seno es
+$A(2\pi/N)^2/8 = 0{,}0006$\,LSB, despreciable. Medido en el test con el código
+real: \textbf{0,99\,LSB máximo a 10\,Hz} (es el redondeo de la tabla más el de
+la salida), contra 2,96\,LSB del camino directo.
+
+La cuadrada y las sierras \textbf{no} se interpolan. Sus flancos se convertirían
+en rampas de $1/N$ del período (244\,$\mu$s a 1\,Hz). Por encima de 244\,Hz se
+usa el camino directo, más rápido, porque el error de truncamiento ya queda al
+nivel del ruido del DAC. El umbral se cambia con \texttt{DDS\_INTERP\_MAX\_STEP}.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=0.9\linewidth, height=6.2cm, xlabel={muestra $n$ ($\mu$s)},
+             ylabel={código DAC}, grid=major,
+             legend pos=south east,
+             legend style={font=\small}, tick label style={font=\small},
+             /pgf/number format/use comma, /pgf/number format/1000 sep={}]
+  \addplot[very thick, black!45] table[x=n, y=ideal] {datos_escalera.dat};
+  \addlegendentry{seno ideal}
+  \addplot[thick, red, const plot] table[x=n, y=sin_interp] {datos_escalera.dat};
+  \addlegendentry{sin interpolación (escalera)}
+  \addplot[thick, azul, const plot] table[x=n, y=con_interp] {datos_escalera.dat};
+  \addlegendentry{con interpolación (firmware)}
+\end{axis}
+\end{tikzpicture}
+\caption{Seno de 10\,Hz cerca del cruce por cero, salida real de \texttt{dds\_fill()}.
+Sin interpolar, cada muestra de tabla se repite 24 veces (saltos de $\approx 3$\,LSB).
+Interpolando, la salida avanza de a 1\,LSB.}
+\end{figure}
+
+\subsection{Presupuesto de CPU y memoria}
+
+\begin{center}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Camino (CH2 en 90°)} & \textbf{Instr./muestra} & \textbf{Ciclos (est.)} & \textbf{CPU 1\,MS/s} & \textbf{CPU 5\,MS/s} \\
+\midrule
+Directo     & 10 & $\approx 12$ & $\approx 5$\,\%  & $\approx 25$\,\% \\
+Interpolado & 22 & $\approx 26$ & $\approx 10$\,\% & $\approx 52$\,\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+A 1\,MS/s hay 250 ciclos por muestra. El firmware mide el peor caso real con el
+contador DWT y lo muestra por UART (\texttt{CPU x.x\%}). RAM: 16\,KB de tablas +
+2\,KB de buffer + pila $\approx$ 20\,KB de 32\,KB. Flash: 18,5\,KB de 128\,KB.
+
+% =========================================================================
+\clearpage
+\section{Diagramas de flujo}
+
+\begin{figure}[h!]
+\centering
+\begin{tikzpicture}[node distance=6mm]
+  \node[inicio] (a) {Inicio (\texttt{main})};
+  \node[sub, below=of a] (b) {\texttt{board\_init()}\\VOS0, flash 5 WS, PLL1 = 250\,MHz,\\ICACHE, SysTick 1\,ms, USART2};
+  \node[sub, below=of b] (c) {\texttt{dds\_core\_init()}\\genera la tabla del seno (4097 muestras)\\$M = \text{round}(1\,\text{kHz}\cdot2^{32}/F_s)$};
+  \node[sub, below=of c] (d) {\texttt{encoder\_init()}\\TIM1 y TIM3 en modo encoder x4,\\filtro de entrada, pull-ups, pulsadores};
+  \node[sub, below=of d] (e) {\texttt{ui\_init()}\\estado inicial, \texttt{display\_init()} (weak)};
+  \node[sub, below=of e] (f) {\texttt{dds\_hw\_start()}\\precarga el buffer, TIM2 (TRGO),\\DAC dual (HFSEL), GPDMA circular, CEN};
+  \node[sub, below=of f] (g) {\texttt{ui\_task()}\\(ver Fig.~\ref{fig:ui})};
+  \node[proceso, below=of g] (h) {\texttt{\_\_WFI()}: dormir hasta la próxima IRQ\\(DMA cada 256\,$\mu$s o SysTick)};
+  \draw[flecha] (a) -- (b);
+  \draw[flecha] (b) -- (c);
+  \draw[flecha] (c) -- (d);
+  \draw[flecha] (d) -- (e);
+  \draw[flecha] (e) -- (f);
+  \draw[flecha] (f) -- (g);
+  \draw[flecha] (g) -- (h);
+  \draw[flecha] (h.south) -- ++(0,-5mm) -| node[etq, pos=0.75, left]{lazo infinito} ($(g.west)+(-8mm,0)$) -- (g.west);
+\end{tikzpicture}
+\caption{Programa principal.}
+\label{fig:main}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\begin{tikzpicture}[node distance=6mm and 12mm]
+  \node[inicio] (s) {\texttt{ui\_task()}};
+  \node[io, below=of s] (r1) {Leer clicks del encoder F\\$\Delta = (\text{CNT}_{\text{TIM1}} - \text{ant})/4$};
+  \node[decision, below=of r1] (d1) {$\Delta \neq 0$?};
+  \node[procesoc, right=of d1] (p1) {$f \leftarrow f + \Delta\cdot\text{paso}$, limitado a $[0{,}1\,\text{Hz};\,0{,}4F_s]$\\$M \leftarrow \text{round}(f\,2^{32}/F_s)$};
+  \node[decision, below=12mm of d1] (d2) {¿Pulsador F?};
+  \node[procesoc, right=of d2] (p2) {paso $\leftarrow$ siguiente\\0,1 / 1 / 10 / \dots / 100k Hz};
+  \node[io, below=12mm of d2] (r2) {Leer clicks del encoder W\\(TIM3)};
+  \node[decision, below=of r2] (d3) {$\Delta \neq 0$?};
+  \node[procesoc, right=of d3] (p3) {onda $\leftarrow$ (onda $+\Delta$) mod 7\\generar tabla en el buffer \emph{inactivo}\\e intercambiar puntero (atómico)};
+  \node[decision, below=12mm of d3] (d4) {¿Pulsador W?};
+  \node[procesoc, right=of d4] (p4) {modo CH2 $\leftarrow$ siguiente\\90° / invertida / sync / igual};
+  \node[decision, below=12mm of d4] (d5) {¿Hubo cambios?};
+  \node[procesoc, right=of d5] (p5) {\texttt{display\_update()}\\+ línea por UART};
+  \node[inicio, below=12mm of d5] (e) {Fin};
+
+  \foreach \d/\n [count=\k] in {d1/d2, d2/r2, d3/d4, d4/d5, d5/e}
+    \coordinate (m\k) at ($(\d.south)!0.5!(\n.north)$);
+
+  \draw[flecha] (s) -- (r1);
+  \draw[flecha] (r1) -- (d1);
+  \draw[flecha] (r2) -- (d3);
+  \foreach \d/\p/\n [count=\k] in {d1/p1/d2, d2/p2/r2, d3/p3/d4, d4/p4/d5, d5/p5/e} {
+    \draw[flecha] (\d) -- node[etq, above]{sí} (\p);
+    \draw[flecha] (\d) -- node[etq, right, pos=0.3]{no} (\n);
+    \draw[flecha] (\p.south) |- (m\k);
+  }
+\end{tikzpicture}
+\caption{Lazo de interfaz: los encoders cuentan por hardware y \texttt{ui\_task()}
+solo lee la diferencia. Los cambios de $M$ entran en el borde del bloque
+siguiente, con fase continua.}
+\label{fig:ui}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\begin{tikzpicture}[node distance=6mm and 7mm, procesoc/.append style={text width=37mm}]
+  \node[inicio] (s) {IRQ GPDMA1 canal 0};
+  \node[decision, below=of s] (d0) {¿HTF\\(media transf.)?};
+  \node[procesoc, right=11mm of d0] (h) {limpiar HTF\\destino = 1.ª mitad};
+  \node[procesoc, left=11mm of d0] (t) {limpiar TCF\\destino = 2.ª mitad};
+  \node[ancho, below=14mm of d0] (p) {Leer parámetros \textbf{una sola vez}:\\tabla activa $T$, palabra $M$, modo CH2, fase};
+  \node[decision, below=of p, text width=34mm] (d1) {¿forma interpolable\\y $M < 2^{20}$?\\($f < F_s/N$)};
+  \node[procesoc, left=of d1, fill=verde] (mi) {modo \textbf{interpolado}};
+  \node[procesoc, right=of d1, fill=verde] (md) {modo \textbf{directo}};
+  \node[ancho, below=14mm of d1] (i) {$i \leftarrow \text{fase} \gg 20$ \quad (índice de 12 bits)};
+  \node[decision, below=of i] (d2) {¿interpolado?};
+  \node[procesoc, left=of d2, text width=50mm] (yi) {$\phi \leftarrow (\text{fase}\gg8)\,\&\,\text{0xFFF}$\\$y_1 \leftarrow T[i] + (\Delta T\,\phi + 2^{11})\gg 12$\\$\Delta T = T[i+1]-T[i]$};
+  \node[procesoc, right=of d2] (yd) {$y_1 \leftarrow T[i]$};
+  \node[ancho, below=16mm of d2] (c2) {CH2 según el modo:\\
+     90°: $y_2 = T[(\text{fase}+2^{30})\gg20]$ \qquad invertida: $y_2 = 4095-y_1$\\
+     sync: $y_2 = 4095$ si fase $< 2^{31}$, si no 0 \qquad igual: $y_2 = y_1$};
+  \node[ancho, below=of c2] (w) {\texttt{buf[k]} $\leftarrow y_1 \,|\, (y_2 \ll 16)$ \quad (formato DHR12RD)\\
+     fase $\leftarrow$ fase $+ M$ \quad (desborde = módulo $2^{32}$)};
+  \node[decision, below=of w] (d3) {¿$k < 256$?};
+  \node[ancho, below=8mm of d3] (g) {guardar la fase y medir ciclos (DWT)};
+  \node[inicio, below=of g] (e) {Fin de la ISR};
+
+  \coordinate (m0) at ($(d0.south)!0.5!(p.north)$);
+  \coordinate (m1) at ($(d1.south)!0.5!(i.north)$);
+  \coordinate (m2) at ($(d2.south)!0.5!(c2.north)$);
+
+  \draw[flecha] (s) -- (d0);
+  \draw[flecha] (d0) -- node[etq, above]{sí} (h);
+  \draw[flecha] (d0) -- node[etq, above]{no (TCF)} (t);
+  \draw[thick] (h.south) |- (m0) -| (t.south);
+  \draw[flecha] (m0) -- (p);
+  \draw[flecha] (p) -- (d1);
+  \draw[flecha] (d1) -- node[etq, above]{sí} (mi);
+  \draw[flecha] (d1) -- node[etq, above]{no} (md);
+  \draw[thick] (mi.south) |- (m1) -| (md.south);
+  \draw[flecha] (m1) -- (i);
+  \draw[flecha] (i) -- (d2);
+  \draw[flecha] (d2) -- node[etq, above]{sí} (yi);
+  \draw[flecha] (d2) -- node[etq, above]{no} (yd);
+  \draw[thick] (yi.south) |- (m2) -| (yd.south);
+  \draw[flecha] (m2) -- (c2);
+  \draw[flecha] (c2) -- (w);
+  \draw[flecha] (w) -- (d3);
+  \draw[flecha] (d3) -- node[etq, right]{no} (g);
+  \draw[flecha] (d3.east) -- node[etq, above]{sí, $k$++} ($(d3.east -| md.east)+(4mm,0)$) |- (i.east);
+  \draw[flecha] (g) -- (e);
+\end{tikzpicture}
+\caption{Motor DDS (ISR del GPDMA). En el código, la decisión ``¿interpolado?''
+y el modo de CH2 se resuelven \emph{antes} del lazo: el compilador genera 8
+lazos especializados sin ningún \texttt{if} adentro.}
+\label{fig:isr}
+\end{figure}
+
+\begin{figure}[h!]
+\centering
+\begin{tikzpicture}[node distance=5mm and 10mm]
+  \node[inicio] (s) {SysTick (1\,ms)};
+  \node[proceso, below=of s] (a) {\texttt{ms++}; para cada pulsador:\\leer pin (\texttt{IDR})};
+  \node[decision, below=of a] (d1) {¿lectura $\neq$\\estado estable?};
+  \node[procesoc, right=of d1] (r) {contador $\leftarrow$ 0};
+  \node[proceso, below=8mm of d1] (c) {contador++};
+  \node[decision, below=of c] (d2) {¿contador\\$\geq$ 20?};
+  \node[proceso, below=8mm of d2] (u) {estado $\leftarrow$ lectura; contador $\leftarrow 0$\\si quedó apretado: evento = 1};
+  \node[inicio, below=of u] (e) {Fin};
+  \draw[flecha] (s) -- (a);
+  \draw[flecha] (a) -- (d1);
+  \draw[flecha] (d1) -- node[etq, above]{no} (r);
+  \draw[flecha] (d1) -- node[etq, right]{sí} (c);
+  \draw[flecha] (c) -- (d2);
+  \draw[flecha] (d2) -- node[etq, right]{sí} (u);
+  \draw[flecha] (d2.east) -- node[etq, above]{no} ++(15mm,0) |- (e.east);
+  \draw[flecha] (r.south) |- (e.east);
+  \draw[flecha] (u) -- (e);
+\end{tikzpicture}
+\caption{Antirrebote de los pulsadores por integración (20\,ms estables).}
+\label{fig:deb}
+\end{figure}
+
+% =========================================================================
+\clearpage
+\section{Conexionado (LQFP48)}
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Pin} & \textbf{Función} & \textbf{AF} & \textbf{Conexión} \\
+\midrule
+PA4  & DAC1\_OUT1 & analóg. & Salida CH1 $\rightarrow$ filtro $\rightarrow$ BNC \\
+PA5  & DAC1\_OUT2 & analóg. & Salida CH2 $\rightarrow$ filtro $\rightarrow$ BNC \\
+PA8 / PA9 & TIM1\_CH1 / CH2 & AF1 & Encoder FRECUENCIA (A / B) \\
+PA10 & GPIO entrada, pull-up & -- & Pulsador FRECUENCIA (cambia el paso) \\
+PA6 / PA7 & TIM3\_CH1 / CH2 & AF2 & Encoder FORMA (A / B) \\
+PB0  & GPIO entrada, pull-up & -- & Pulsador FORMA (modo de CH2) \\
+PA2  & USART2\_TX & AF7 & Depuración 115200\,8N1 (opcional) \\
+PA13 / PA14 & SWDIO / SWCLK & -- & ST-LINK \\
+\midrule
+PB6 / PB7 & I2C1 SCL / SDA & AF4 & \emph{Reservado:} pantalla I$^2$C (SSD1306) \\
+PB13/15/12 & SPI2 SCK/MOSI/CS & AF5 & \emph{Reservado:} pantalla SPI (ST7735, ILI9341) \\
+PB14 / PB10 & GPIO & -- & \emph{Reservado:} D/C y RESET de la pantalla \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent\textbf{Recomendaciones de hardware.} Encoders con el común a GND y una
+red RC de 10\,k$\Omega$/10\,nF en A y B. En el LQFP48, $V_{REF+}$ está unido a
+$V_{DDA}$: alimentá $V_{DDA}$ con un filtro LC aparte para bajar el ruido del DAC.
+Con el buffer interno activado la salida no llega a los rieles (unos 0,2\,V de
+cada lado). Para amplitud y offset ajustables agregá una etapa con un
+amplificador operacional después del filtro reconstructor.
+
+\noindent\textbf{Pantalla futura.} \texttt{ui.c} define \texttt{display\_init()} y
+\texttt{display\_update(const ui\_state\_t*)} como \texttt{weak} (vacías). Basta
+con crear \texttt{display.c} con esas dos funciones: reciben la frecuencia
+pedida y la real, el paso (para dibujar el cursor), la forma de onda, el modo de
+CH2 y si la interpolación está activa. El motor DDS no se toca.
+
+\end{document}
