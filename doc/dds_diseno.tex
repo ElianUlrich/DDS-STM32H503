@@ -43,7 +43,7 @@
   etq/.style       = {font=\footnotesize\itshape, inner sep=1pt},
 }
 
-\title{\textbf{Generador de funciones DDS con STM32H503CBT6}\\[2mm]
+\title{\textbf{Generador DDS y osciloscopio con STM32H503CBT6}\\[2mm]
 \large Diseño, decisiones de ingeniería y diagramas de flujo}
 \author{}
 \date{}
@@ -69,6 +69,11 @@ Rango de salida & 0,1\,Hz a 400\,kHz ($0{,}4\,F_s$) \\
 Interpolación & lineal, automática para $f < F_s/N = 244$\,Hz \\
 Encoders & TIM1 (frecuencia) y TIM3 (forma de onda), modo encoder por hardware \\
 Formas de onda & seno, triangular, sierra $\pm$, cuadrada, seno rectificado, arbitraria \\
+\midrule
+Osciloscopio & PA1 $\rightarrow$ ADC1 (único ADC del H503), 0 a 3,3\,V, disparado por TIM6 \\
+Tiempo real & hasta 2\,MS/s a 12 bits; sobremuestreo por hardware hasta 16 bits \\
+Tiempo equivalente & señales periódicas: 256 puntos/período, hasta $\approx 200$\,MS/s equivalentes \\
+Salida de datos & USART2 a 2\,Mbaud por DMA $\rightarrow$ visor \texttt{tools/osciloscopio.py} \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -269,8 +274,10 @@ Interpolado & 22 & $\approx 26$ & $\approx 10$\,\% & $\approx 52$\,\% \\
 \end{tabular}
 \end{center}
 A 1\,MS/s hay 250 ciclos por muestra. El firmware mide el peor caso real con el
-contador DWT y lo muestra por UART (\texttt{CPU x.x\%}). RAM: 16\,KB de tablas +
-2\,KB de buffer + pila $\approx$ 20\,KB de 32\,KB. Flash: 18,5\,KB de 128\,KB.
+contador DWT y lo muestra por UART (\texttt{CPU x.x\%}). Con el osciloscopio
+incluido la RAM queda así: 16\,KB de tablas DDS + 2\,KB de buffer del DAC +
+4\,KB de captura + 2,5\,KB del ETS + pila $\approx$ 28,5\,KB de 32\,KB.
+Flash: 28,4\,KB de 128\,KB.
 
 % =========================================================================
 \clearpage
@@ -418,6 +425,266 @@ lazos especializados sin ningún \texttt{if} adentro.}
 
 % =========================================================================
 \clearpage
+\section{Osciloscopio de 0 a 3,3\,V}
+
+\subsection{¿ADC en paralelo y desfasados? El H503 tiene uno solo}
+
+La idea de poner varios ADC en paralelo sobre la misma entrada, cada uno
+disparado con un desfase de $T_s/N$ (\emph{time-interleaving}), multiplica por
+$N$ la frecuencia de muestreo: mejora la \textbf{resolución en el tiempo}. Pero
+el STM32H503 tiene \textbf{un único ADC} (ADC1). Lo confirman el header CMSIS
+oficial, donde solo existe \texttt{ADC1}, y el datasheet: un ADC de 12 bits a
+2,5\,MS/s. El modo intercalado necesita, por ejemplo, el STM32H563, que tiene
+dos ADC.
+
+Con un solo ADC se aprovecha el mismo principio de dos maneras:
+
+\begin{center}
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{33mm}>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}X>{\raggedright\arraybackslash}p{22mm}@{}}
+\toprule
+\textbf{Técnica} & \textbf{Qué mejora} & \textbf{Requisito} & \textbf{En el H503} \\
+\midrule
+$N$ ADC intercalados (desfase $T_s/N$) & Resolución en el tiempo $\times N$, con cualquier señal (incluso un evento único) & $N$ ADC sincronizados & No (1 ADC) \\
+\textbf{Tiempo equivalente} (ETS): un ADC, muestras en fases distintas de períodos sucesivos & Resolución en el tiempo: 256 puntos por período, hasta $\approx 200$\,MS/s equivalentes & Señal \textbf{periódica} y estable durante la captura (1\,ms) & Sí, modo \texttt{ETS} \\
+\textbf{Sobremuestreo}: promediar $2^n$ conversiones por muestra & Resolución en \textbf{amplitud}: $+\frac{1}{2}$ bit por cada $\times 2$, hasta 16 bits & Señal lenta frente a la velocidad del ADC & Sí, automático en bases $\leq 500$\,kS/s \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Arquitectura}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}[bloque/.append style={text width=23mm}]
+  \node[bloque, fill=gris] (in)  at (0,0)    {Entrada\\PA1\\0 -- 3,3\,V};
+  \node[bloque, fill=gris] (buf) at (3.4,0)  {Buffer\\op-amp\\(externo)};
+  \node[bloque] (adc) at (6.8,0)  {ADC1\\12 bits\\sobremuestreo};
+  \node[bloque] (tim) at (6.8,2.2) {TIM6\\$F_s$ (TRGO)};
+  \node[bloque] (dma) at (10.2,0) {GPDMA1\\canal 1};
+  \node[bloque] (cap) at (13.4,0) {Captura RAM\\$2048\times16$\,b};
+  \node[bloque, fill=verde, text width=30mm] (cpu) at (13.4,-2.6)
+       {\texttt{osc\_task()}\\trigger, mediciones,\\tiempo equivalente};
+  \node[bloque] (udma) at (9.0,-2.6) {GPDMA1\\canal 2};
+  \node[bloque, fill=gris, text width=30mm] (pc) at (4.6,-2.6) {USART2 2\,Mbaud\\$\rightarrow$ PC\\\texttt{osciloscopio.py}};
+  \node[bloque, fill=gris, dashed, text width=30mm] (lcd) at (13.4,-4.7) {Pantalla\\(\texttt{display\_scope})};
+
+  \draw[flecha] (in) -- (buf);
+  \draw[flecha] (buf) -- (adc);
+  \draw[flecha] (tim) -- node[etq, right]{dispara} (adc);
+  \draw[flecha] (adc) -- node[etq, above]{DR} (dma);
+  \draw[flecha] (dma) -- (cap);
+  \draw[flecha] (cap) -- node[etq, right]{TC} (cpu);
+  \draw[flecha] (cpu) -- node[etq, above]{trama} (udma);
+  \draw[flecha] (udma) -- (pc);
+  \draw[flecha, dashed] (cpu) -- (lcd);
+\end{tikzpicture}
+\caption{Cadena de adquisición. Corre en paralelo con el DDS, que sigue
+funcionando solo con TIM2, el DAC y el canal 0 del GPDMA.}
+\end{figure}
+
+El reloj del ADC es $\text{HCLK}/8 = 31{,}25$\,MHz. Una conversión de 12 bits
+dura $2{,}5 + 12{,}5 = 15$ ciclos (480\,ns), así que el máximo en tiempo real
+es \textbf{2\,MS/s}. Para llegar a los 2,5\,MS/s del datasheet hacen falta
+37,5\,MHz, que se pueden obtener con el PLL2. Igual que en el DDS, el timer fija
+el instante de cada conversión sin jitter y el DMA guarda los datos: el CPU solo
+procesa cuando la captura terminó.
+
+\subsection{Base de tiempo y sobremuestreo automático}
+
+Para cada $F_s$ el firmware calcula PSC/ARR del timer y elige, en este orden:
+(1)~el mayor sobremuestreo $R = 2^n$ (hasta 256) que entra en el período de
+muestreo y (2)~con el tiempo que sobra, el mayor tiempo de muestreo del ADC, que
+exige menos a la impedancia de la fuente. Todas las muestras se normalizan a 16
+bits ($0 \ldots 65535 = 0 \ldots 3{,}3$\,V), así el formato no cambia.
+
+\begin{center}
+\begin{tabular}{@{}rrrcrc@{}}
+\toprule
+$F_s$ [S/s] & PSC & ARR & Sobremuestreo & SMP [ciclos] & Resolución efectiva \\
+\midrule
+2\,000\,000 & 0 & 124   & $\times1$   & 2,5  & 12,0 bits \\
+1\,000\,000 & 0 & 249   & $\times1$   & 12,5 & 12,0 bits \\
+500\,000    & 0 & 499   & $\times2$   & 12,5 & 12,5 bits \\
+200\,000    & 0 & 1249  & $\times8$   & 6,5  & 13,5 bits \\
+100\,000    & 0 & 2499  & $\times16$  & 6,5  & 14,0 bits \\
+50\,000     & 0 & 4999  & $\times32$  & 6,5  & 14,5 bits \\
+20\,000     & 0 & 12499 & $\times64$  & 6,5  & 15,0 bits \\
+10\,000     & 0 & 24999 & $\times128$ & 6,5  & 15,5 bits \\
+5\,000      & 0 & 49999 & $\times256$ & 6,5  & 16,0 bits \\
+2\,000      & 1 & 62499 & $\times256$ & 47,5 & 16,0 bits \\
+1\,000      & 3 & 62499 & $\times256$ & 92,5 & 16,0 bits \\
+\bottomrule
+\end{tabular}
+\end{center}
+La resolución efectiva es la teórica, $12 + \frac{1}{2}\log_2 R$. Se alcanza
+cuando la señal trae al menos $\approx 1$\,LSB de ruido, que actúa como
+\emph{dither}.
+
+\subsection{Tiempo equivalente con un solo ADC}
+
+Si la señal es periódica, no hace falta que varios ADC muestreen el mismo
+período en instantes desfasados. Alcanza con que \emph{un} ADC tome cada muestra
+en una fase distinta de períodos sucesivos. Como $F_s/f$ casi nunca es entero,
+eso pasa solo; el algoritmo es:
+
+\begin{enumerate}\itemsep1pt
+  \item Capturar 2048 muestras a $\approx 2$\,MS/s, es decir, muchos períodos seguidos.
+  \item Buscar todos los cruces ascendentes por el nivel medio, con histéresis,
+        e interpolar entre muestras su posición fraccionaria $c_i$.
+  \item Ajustar por mínimos cuadrados $c_i = t_0 + T\,i$. Con cientos de cruces,
+        $T$ queda con un error menor a 1\,ppm. Primero se ajustan los cruces
+        cercanos y la ventana se amplía de a poco, para numerarlos bien aunque
+        se pierda alguno.
+  \item Calcular la fase de cada muestra, $\varphi_k = \operatorname{frac}\big((k-t_0)/T\big)$,
+        y acumularla en el casillero $\lfloor 256\,\varphi_k \rfloor$. Se guarda
+        también dónde cayó dentro del casillero.
+  \item Promediar cada casillero y llevar el valor a su \emph{centro} con la
+        pendiente local, $y_c = \bar y - y'\,\bar\delta$. Sin esta corrección el
+        error llega a 17\,LSB en los flancos; con ella baja a 0,4\,LSB.
+  \item Interpolar los casilleros vacíos y enviar dos períodos (512 puntos) con
+        $\Delta t_{eq} = T/(256\,F_s)$.
+\end{enumerate}
+
+\noindent\textbf{El micro se ``desafina'' a propósito.} Si $F_s/f$ queda cerca
+de un cociente de enteros chicos, las muestras caen siempre en las mismas fases.
+Por ejemplo, 500\,kHz a 2\,MS/s exactos da 4 muestras por período: solo 4 fases
+distintas. Antes de reconstruir, el firmware prueba ARR\,=\,124\ldots131 (de 2,00
+a 1,89\,MS/s), calcula cuántos de los 256 casilleros quedarían cubiertos y, si
+otra $F_s$ cubre mejor, recaptura con esa. Es la versión en el tiempo del
+desfase entre ADC.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=0.92\linewidth, height=6.3cm, xlabel={tiempo [ns]},
+             ylabel={tensión [V]}, grid=major,
+             legend style={font=\small, at={(0.5,1.03)}, anchor=south},
+             legend columns=2, tick label style={font=\small},
+             /pgf/number format/use comma, /pgf/number format/1000 sep={},
+             ymin=0, ymax=3.3, xmin=0, xmax=2740]
+  \addplot[only marks, mark=*, mark size=1.6pt, red] table[x=t_ns, y=v] {datos_ets_rt.dat};
+  \addlegendentry{muestras reales (2,72 por período)}
+  \addplot[thick, azul] table[x=t_ns, y=v] {datos_ets.dat};
+  \addlegendentry{reconstrucción ETS (256 por período)}
+\end{axis}
+\end{tikzpicture}
+\caption{Seno de 730\,kHz capturado a 1,98\,MS/s (simulación del ADC con ruido
+de 1\,LSB y el código real de \texttt{osc\_core.c}). Los puntos rojos son las
+muestras de los dos primeros períodos: a simple vista no se reconoce la forma.
+La curva azul ordena por fase las 2048 muestras de la captura: equivale a
+muestrear cada 5,35\,ns ($\approx 187$\,MS/s).}
+\end{figure}
+
+\begin{center}\small
+\begin{tabular}{@{}rcccccc@{}}
+\toprule
+$f$ señal & Muestras/período & ARR elegido & Cobertura & Error de $f$ & Error de forma & Alineación \\
+\midrule
+50\,kHz  & 39,68 & 125 & 256/256 & 0,6\,ppm & 0,38\,LSB & 0,00\,ns \\
+123,5\,kHz & 16,07 & 125 & 256/256 & 0,3\,ppm & 0,42\,LSB & 0,00\,ns \\
+333\,kHz & 5,91 & 126 & 256/256 & 0,2\,ppm & 0,37\,LSB & $-0{,}23$\,ns \\
+500\,kHz & 3,94 & 126 & 256/256 & 0,7\,ppm & 0,36\,LSB & $+0{,}23$\,ns \\
+730\,kHz & 2,72 & 125 & 256/256 & 0,2\,ppm & 0,44\,LSB & 0,00\,ns \\
+850\,kHz & 2,33 & 125 & 256/256 & 0,5\,ppm & 0,40\,LSB & $-1{,}24$\,ns \\
+\bottomrule
+\end{tabular}
+\end{center}
+Resultados de \texttt{make test} (seno de 2,4\,V\,pp con ruido de 1\,LSB). El
+error de forma es RMS en LSB de 12 bits. El límite práctico es $f < F_s/2{,}2
+\approx 900$\,kHz, porque hacen falta al menos dos muestras por período para
+detectar los cruces, y la señal debe repetirse igual durante la captura. Para
+eventos únicos se usa el modo en tiempo real. Por encima de unos pocos MHz
+también limita el ancho de banda analógico de la entrada del ADC.
+
+\subsection{Controles}
+
+Mantener apretado el encoder FORMA cambia entre la página DDS y la del
+osciloscopio, que arranca a adquirir solo. El generador sigue funcionando
+mientras se mide: se puede ver la salida del DDS conectando PA4 a PA1.
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Encoder} & \textbf{Acción} & \textbf{Página osciloscopio} \\
+\midrule
+FRECUENCIA & girar          & frecuencia de muestreo (horario = más rápido) \\
+           & pulsar         & modo AUTO $\rightarrow$ NORMAL $\rightarrow$ ETS \\
+           & mantener       & RUN / STOP \\
+FORMA      & girar          & nivel de trigger (pasos de 33\,mV) \\
+           & pulsar         & flanco ascendente / descendente \\
+           & mantener       & volver a la página DDS \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[h!]
+\centering
+\begin{tikzpicture}
+  \node[inicio, minimum width=26mm] (lib) at (0,0) {LIBRE};
+  \node[inicio, minimum width=26mm, fill=amarillo] (cap) at (8,0) {CAPTURANDO};
+  \node[decision] (hay) at (8,-2.8) {¿hay trama para enviar?};
+  \node[inicio, minimum width=26mm, fill=rojo] (env) at (8,-5.6) {ENVIANDO};
+  \draw[flecha] (lib) -- node[etq, above, align=center]{RUN y UART libre:\\\texttt{osc\_hw\_start()}} (cap);
+  \draw[flecha] (cap) -- node[etq, right, align=left]{DMA terminó: normalizar a 16 bits\\y procesar (tiempo real o ETS)} (hay);
+  \draw[flecha] (hay) -- node[etq, right]{sí: encabezado + DMA de la UART} (env);
+  \draw[flecha] (hay.west) -- node[etq, above, align=center]{no: NORMAL sin trigger,\\o ETS cambió de $F_s$} (0.5,-2.8) -- ([xshift=5mm]lib.south);
+  \draw[flecha] (env.west) -- node[etq, below]{la UART terminó} (-0.5,-5.6) -- ([xshift=-5mm]lib.south);
+\end{tikzpicture}
+\caption{Máquina de estados de \texttt{osc\_task()}, en el lazo principal. Si
+cambia la configuración, se aborta la captura y se vuelve a LIBRE.}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\begin{tikzpicture}[node distance=6mm and 10mm]
+  \node[inicio] (s) {Captura terminada (modo ETS)};
+  \node[ancho, below=of s] (a) {Mínimo, máximo, nivel medio e histéresis};
+  \node[ancho, below=of a] (b) {Cruces ascendentes con histéresis:\\posición $c_i$ interpolada entre muestras};
+  \node[ancho, below=of b] (c) {Regresión $c_i = t_0 + T\,i$ con ventana creciente\\$\Rightarrow$ período $T$ (en muestras) y fase inicial $t_0$};
+  \node[decision, below=of c, text width=34mm] (d1) {¿periódica y al menos 4 períodos?};
+  \node[procesoc, right=of d1] (rt) {mostrar en tiempo real};
+  \node[ancho, below=10mm of d1] (e) {Para ARR = 124 \ldots 131: casilleros\\cubiertos por las fases $\operatorname{frac}(k/T')$};
+  \node[decision, below=of e, text width=34mm] (d2) {¿otra $F_s$ cubre mejor?};
+  \node[procesoc, right=of d2] (re) {cambiar ARR\\y recapturar};
+  \node[ancho, below=10mm of d2] (f) {Para cada muestra $k$:\\$\varphi = \operatorname{frac}((k - t_0)/T)$, \; $b = \lfloor 256\,\varphi \rfloor$\\acumular valor y desvío dentro del casillero};
+  \node[ancho, below=of f] (g) {Promediar y corregir al centro: $y_c = \bar y - y'\,\bar\delta$};
+  \node[ancho, below=of g] (h) {Interpolar casilleros vacíos};
+  \node[io, below=of h] (i) {Trama: 2 períodos $\times$ 256 puntos\\$\Delta t = T/(256\,F_s)$, $f = F_s/T$};
+  \draw[flecha] (s) -- (a);
+  \draw[flecha] (a) -- (b);
+  \draw[flecha] (b) -- (c);
+  \draw[flecha] (c) -- (d1);
+  \draw[flecha] (d1) -- node[etq, above]{no} (rt);
+  \draw[flecha] (d1) -- node[etq, right]{sí} (e);
+  \draw[flecha] (e) -- (d2);
+  \draw[flecha] (d2) -- node[etq, above]{sí} (re);
+  \draw[flecha] (d2) -- node[etq, right]{no} (f);
+  \draw[flecha] (f) -- (g);
+  \draw[flecha] (g) -- (h);
+  \draw[flecha] (h) -- (i);
+\end{tikzpicture}
+\caption{Procesamiento en tiempo equivalente (\texttt{process\_ets()} y \texttt{osc\_core.c}).}
+\end{figure}
+
+\subsection{Acondicionamiento de la entrada}
+
+La entrada va directo al ADC: el rango es de 0 a 3,3\,V
+($V_{REF+} = V_{DDA}$ en el LQFP48). Recomendaciones:
+\begin{itemize}\itemsep0pt
+  \item \textbf{Protección:} resistencia serie de 1\,k$\Omega$ y diodos Schottky
+        a 3,3\,V y a GND (por ejemplo, BAT54S).
+  \item \textbf{Buffer:} a 2\,MS/s el ADC muestrea durante solo 80\,ns
+        (2,5 ciclos), así que la fuente tiene que ser de baja impedancia. Un
+        operacional \emph{rail-to-rail} rápido como seguidor, por ejemplo un
+        OPA350 o similar, con un capacitor de 1--10\,nF a la salida para el
+        pico de carga del ADC. En las bases lentas el firmware alarga solo el
+        tiempo de muestreo.
+  \item \textbf{Señales bipolares:} divisor resistivo más un \emph{offset} de
+        1,65\,V con el mismo operacional.
+\end{itemize}
+
+% =========================================================================
+\clearpage
 \section{Conexionado (LQFP48)}
 
 \begin{center}
@@ -431,7 +698,8 @@ PA8 / PA9 & TIM1\_CH1 / CH2 & AF1 & Encoder FRECUENCIA (A / B) \\
 PA10 & GPIO entrada, pull-up & -- & Pulsador FRECUENCIA (cambia el paso) \\
 PA6 / PA7 & TIM3\_CH1 / CH2 & AF2 & Encoder FORMA (A / B) \\
 PB0  & GPIO entrada, pull-up & -- & Pulsador FORMA (modo de CH2) \\
-PA2  & USART2\_TX & AF7 & Depuración 115200\,8N1 (opcional) \\
+PA1  & ADC1\_INP1 & analóg. & \textbf{Entrada del osciloscopio} (0 a 3,3\,V) \\
+PA2  & USART2\_TX & AF7 & Estado + tramas del osciloscopio, 2\,Mbaud 8N1 \\
 PA13 / PA14 & SWDIO / SWCLK & -- & ST-LINK \\
 \midrule
 PB6 / PB7 & I2C1 SCL / SDA & AF4 & \emph{Reservado:} pantalla I$^2$C (SSD1306) \\
@@ -448,10 +716,13 @@ Con el buffer interno activado la salida no llega a los rieles (unos 0,2\,V de
 cada lado). Para amplitud y offset ajustables agregá una etapa con un
 amplificador operacional después del filtro reconstructor.
 
-\noindent\textbf{Pantalla futura.} \texttt{ui.c} define \texttt{display\_init()} y
-\texttt{display\_update(const ui\_state\_t*)} como \texttt{weak} (vacías). Basta
-con crear \texttt{display.c} con esas dos funciones: reciben la frecuencia
-pedida y la real, el paso (para dibujar el cursor), la forma de onda, el modo de
-CH2 y si la interpolación está activa. El motor DDS no se toca.
+\noindent\textbf{Pantalla futura.} Hay tres funciones \texttt{weak} (vacías):
+\texttt{display\_init()}, \texttt{display\_update(estado)} y
+\texttt{display\_scope(trama, puntos)}. Basta con
+crear \texttt{display.c} con esas funciones. La primera recibe la página activa,
+la frecuencia pedida y la real, el paso (para dibujar el cursor), la forma de
+onda, el modo de CH2 y la configuración del osciloscopio. La segunda recibe
+cada trama lista para dibujar: puntos de 16 bits, $\Delta t$ entre puntos y
+mediciones. Ni el motor DDS ni la adquisición se tocan.
 
 \end{document}

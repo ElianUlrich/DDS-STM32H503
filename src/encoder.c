@@ -23,7 +23,9 @@ typedef struct {
     uint8_t       btn_pin;
     uint8_t       btn_stable;       /* 1 = suelto, 0 = apretado              */
     uint8_t       btn_count;
-    volatile uint8_t btn_event;
+    uint16_t      held_ms;          /* tiempo que lleva apretado             */
+    volatile uint8_t btn_event;     /* pulsación corta (al soltar)           */
+    volatile uint8_t btn_long;      /* pulsación larga (al cumplir el tiempo) */
 } enc_t;
 
 static enc_t s_enc[ENC_COUNT] = {
@@ -84,8 +86,17 @@ bool encoder_button_event(enc_id_t id)
     return false;
 }
 
+bool encoder_button_long(enc_id_t id)
+{
+    enc_t *e = &s_enc[id];
+    if (e->btn_long) { e->btn_long = 0U; return true; }
+    return false;
+}
+
 /* Antirrebote por integración: el estado cambia solo si la entrada se mantuvo
- * distinta durante BTN_DEBOUNCE_MS muestras consecutivas de 1 ms.          */
+ * distinta durante BTN_DEBOUNCE_MS muestras consecutivas de 1 ms.
+ * Pulsación corta: se informa al SOLTAR, si duró menos de BTN_LONG_MS.
+ * Pulsación larga: se informa apenas se cumplen BTN_LONG_MS apretado.      */
 void board_tick_1ms_hook(void)
 {
     for (uint32_t i = 0; i < ENC_COUNT; i++) {
@@ -95,10 +106,17 @@ void board_tick_1ms_hook(void)
             if (++e->btn_count >= BTN_DEBOUNCE_MS) {
                 e->btn_stable = raw;
                 e->btn_count  = 0U;
-                if (raw == 0U) e->btn_event = 1U;   /* flanco de pulsación */
+                if (raw == 0U) {
+                    e->held_ms = 0U;                      /* se apretó  */
+                } else if (e->held_ms < BTN_LONG_MS) {
+                    e->btn_event = 1U;                    /* corta      */
+                }
             }
         } else {
             e->btn_count = 0U;
+        }
+        if (e->btn_stable == 0U && e->held_ms < 0xFFFFU) {
+            if (++e->held_ms == BTN_LONG_MS) e->btn_long = 1U;   /* larga */
         }
     }
 }

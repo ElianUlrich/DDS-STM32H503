@@ -90,22 +90,73 @@ static void uart_init(void)
     RCC->APB1LENR |= RCC_APB1LENR_USART2EN;
     (void)RCC->APB1LENR;
     gpio_set_af(GPIOA, 2U, 7U, 0U);                       /* PA2 = USART2_TX */
-    /* Reloj de núcleo por defecto = PCLK1 = 250 MHz. */
+    /* Reloj de núcleo por defecto = PCLK1 = 250 MHz -> 2 Mbaud exactos. */
     USART2->BRR = (SYSCLK_HZ + DDS_DEBUG_BAUD / 2U) / DDS_DEBUG_BAUD;
+    USART2->CR3 = USART_CR3_DMAT;                         /* TX por DMA      */
     USART2->CR1 = USART_CR1_TE | USART_CR1_UE;
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPDMA1EN;
+    (void)RCC->AHB1ENR;
+#endif
+}
+
+/* ---- Transmisión por GPDMA1 canal 2 (tramas del osciloscopio) ---- */
+#define UART_DMA_CH          GPDMA1_Channel2
+#define GPDMA1_REQ_USART2_TX 24UL
+
+bool uart_tx_busy(void)
+{
+#if DDS_DEBUG_UART
+    return (UART_DMA_CH->CSR & DMA_CSR_IDLEF) == 0U;
+#else
+    return false;
+#endif
+}
+
+void uart_write_blocking(const void *data, uint32_t len)
+{
+#if DDS_DEBUG_UART
+    const uint8_t *p = (const uint8_t *)data;
+    while (uart_tx_busy()) { }
+    while (len--) {
+        while ((USART2->ISR & USART_ISR_TXE_TXFNF) == 0U) { }
+        USART2->TDR = *p++;
+    }
+#else
+    (void)data; (void)len;
+#endif
+}
+
+void uart_send_dma(const void *data, uint32_t len)
+{
+#if DDS_DEBUG_UART
+    while (uart_tx_busy()) { }
+    DMA_Channel_TypeDef *ch = UART_DMA_CH;
+    ch->CFCR = DMA_CFCR_TCF | DMA_CFCR_HTF | DMA_CFCR_DTEF | DMA_CFCR_ULEF
+             | DMA_CFCR_USEF | DMA_CFCR_SUSPF | DMA_CFCR_TOF;
+    ch->CTR1 = DMA_CTR1_SINC;                        /* bytes, memoria -> TDR */
+    ch->CTR2 = (GPDMA1_REQ_USART2_TX << DMA_CTR2_REQSEL_Pos) | DMA_CTR2_DREQ;
+    ch->CBR1 = len;
+    ch->CSAR = (uint32_t)data;
+    ch->CDAR = (uint32_t)&USART2->TDR;
+    ch->CLLR = 0U;
+    ch->CCR  = DMA_CCR_EN;                           /* prioridad baja */
+#else
+    (void)data; (void)len;
 #endif
 }
 
 void dbg_puts(const char *s)
 {
-#if DDS_DEBUG_UART
-    while (*s) {
-        while ((USART2->ISR & USART_ISR_TXE_TXFNF) == 0U) { }
-        USART2->TDR = (uint8_t)*s++;
-    }
-#else
-    (void)s;
-#endif
+    uint32_t n = 0U;
+    while (s[n]) n++;
+    uart_write_blocking(s, n);
+}
+
+void delay_us(uint32_t us)
+{
+    const uint32_t t0 = DWT->CYCCNT;
+    const uint32_t cycles = us * (SYSCLK_HZ / 1000000U);
+    while ((DWT->CYCCNT - t0) < cycles) { }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -116,12 +167,12 @@ void board_init(void)
     RCC->AHB2ENR |= RCC_AHB2ENR_GPIOAEN | RCC_AHB2ENR_GPIOBEN;
     (void)RCC->AHB2ENR;
 
-    uart_init();
-
-    /* Contador de ciclos (DWT) para medir la carga de la ISR. */
+    /* Contador de ciclos (DWT): mide la carga de la ISR y sirve de retardo. */
     DCB->DEMCR |= DCB_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0U;
     DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+
+    uart_init();
 
     /* SysTick a 1 kHz, prioridad baja (la ISR del DDS tiene prioridad 0). */
     SysTick_Config(SYSCLK_HZ / 1000U);

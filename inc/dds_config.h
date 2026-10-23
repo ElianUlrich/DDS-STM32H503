@@ -99,7 +99,8 @@
 /*  PA6  TIM3_CH1   encoder FORMA DE ONDA A  AF2                            */
 /*  PA7  TIM3_CH2   encoder FORMA DE ONDA B  AF2                            */
 /*  PB0  GPIO       pulsador FORMA DE ONDA (cambia el modo de CH2)          */
-/*  PA2  USART2_TX  depuración 115200 8N1  AF7 (opcional)                   */
+/*  PA1  ADC1_INP1  ENTRADA DEL OSCILOSCOPIO 0..3,3 V      analógico         */
+/*  PA2  USART2_TX  estado + tramas del osciloscopio, 2 Mbaud 8N1  AF7      */
 /*  Reservados para la pantalla futura:                                     */
 /*    I2C1: PB6 SCL / PB7 SDA (AF4)   ó   SPI2: PB13 SCK / PB15 MOSI (AF5), */
 /*    PB12 CS, PB14 D/C, PB10 RST                                           */
@@ -114,8 +115,29 @@
 /* Antirrebote de pulsadores: muestras de 1 ms estables.                     */
 #define BTN_DEBOUNCE_MS         20U
 
-/* Salida de depuración por USART2 (1 = habilitada).                         */
+/* Pulsación larga (cambia de página DDS <-> osciloscopio, run/stop).       */
+#define BTN_LONG_MS             600U
+
+/* USART2: texto de estado y tramas del osciloscopio (1 = habilitada).
+ * 2 Mbaud = 250 MHz / 125 exactos. Lo soportan CP2102N, FT232R, CH340 y el
+ * puerto virtual del ST-LINK V3. Con adaptadores lentos bajalo a 921600.    */
 #define DDS_DEBUG_UART          1
-#define DDS_DEBUG_BAUD          115200UL
+#define DDS_DEBUG_BAUD          2000000UL
+
+/* ======================================================================== */
+/*  Osciloscopio                                                            */
+/* ======================================================================== */
+/* El STM32H503 tiene UN solo ADC (ADC1, 12 bits). Reloj del ADC:
+ *   HCLK 250 MHz / 8 = 31,25 MHz  ->  conversión de 12 bits en 15 ciclos
+ *   (2,5 de muestreo + 12,5) = 480 ns  ->  hasta 2 MS/s en tiempo real.
+ * (Para 2,5 MS/s hacen falta 37,5 MHz, por ejemplo con el PLL2.)            */
+#define OSC_ADC_PRESC_CODE      4U              /* PRESC = 0100 -> /8     */
+#define OSC_ADC_CLK_HZ          (SYSCLK_HZ / 8UL)
+#define OSC_ADC_CHANNEL         1U              /* PA1 = ADC1_INP1        */
+
+/* Tiempo equivalente: Fs base 2 MS/s (ARR = 124) y hasta 7 pasos de
+ * "desafinación" (ARR 125..131 = 1,98..1,89 MS/s) para cubrir todas las fases. */
+#define OSC_ETS_ARR_MIN         124U
+#define OSC_ETS_ARR_MAX         131U
 
 #endif /* DDS_CONFIG_H */

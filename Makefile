@@ -2,7 +2,7 @@
 #   make cmsis   -> descarga los headers CMSIS oficiales de ST (una vez)
 #   make         -> compila build/dds.elf / .hex / .bin
 #   make flash   -> graba con STM32_Programmer_CLI (ST-LINK por SWD)
-#   make test    -> prueba el núcleo DDS en la PC (genera datos para el PDF)
+#   make test    -> prueba los núcleos DDS y osciloscopio en la PC (y el visor)
 #   make tabla   -> regenera inc/wave_arb.h (forma de onda arbitraria)
 
 TARGET     = dds
@@ -25,6 +25,7 @@ LDFLAGS = $(MCU) -T$(LDSCRIPT) --specs=nano.specs \
           -Wl,--gc-sections -Wl,-Map=$(BUILD)/$(TARGET).map -Wl,--print-memory-usage
 
 SRCS = src/main.c src/board.c src/dds_core.c src/dds_hw.c src/encoder.c src/ui.c \
+       src/osc_core.c src/osc_hw.c src/osc.c \
        $(CMSIS_DEV)/Source/Templates/system_stm32h5xx.c
 ASMS = $(CMSIS_DEV)/Source/Templates/gcc/startup_stm32h503xx.s
 
@@ -64,7 +65,10 @@ cmsis:
 test:
 	mkdir -p $(BUILD)
 	gcc -O2 -Wall -Wextra -Iinc test/test_host.c src/dds_core.c -lm -o $(BUILD)/test_host
+	gcc -O2 -Wall -Wextra -Iinc test/test_osc.c src/osc_core.c -lm -o $(BUILD)/test_osc
 	./$(BUILD)/test_host doc
+	./$(BUILD)/test_osc doc $(BUILD)
+	python3 tools/osciloscopio.py --archivo $(BUILD)/trama_prueba.bin --texto
 
 tabla:
 	python3 tools/gen_tabla.py

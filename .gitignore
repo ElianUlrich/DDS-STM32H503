@@ -8,3 +8,5 @@ doc/*.log
 doc/*.out
 doc/*.toc
 doc/*.synctex.gz
+# Python
+__pycache__/
